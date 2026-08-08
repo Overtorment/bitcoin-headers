@@ -6,7 +6,7 @@ const {
   bitsToTarget,
   checkpointSeedRecord,
   validateHeaderChain,
-} = await import("../../dist/index.js");
+} = await import("../../src/index.ts");
 
 assert.equal(CHECKPOINT_HEIGHT, 665_280);
 assert.equal(MAINNET_HEADER_CONSENSUS.checkpoint.height, 665_280);
@@ -27,7 +27,7 @@ const chain = validateHeaderChain(
 assert.equal(chain.tipHeight, 665_280);
 assert.ok(bitsToTarget(seed.header.bits) > 0n);
 
-const rn = await import("../../dist/react-native.js");
+const rn = await import("../../src/react-native.ts");
 assert.equal(rn.CHECKPOINT_HEIGHT, 665_280);
 assert.equal(
   rn.validateHeaderChain(
