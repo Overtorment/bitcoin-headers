@@ -38,7 +38,7 @@ console.log(chain.tipHeight, chain.tipHashDisplay, chain.chainWork);
 ## React Native
 
 Import the package root (or the `react-native` export condition). Do not pull in
-Node built-ins; the RN build bundles `@noble/hashes`.
+Node built-ins; React Native uses the same TypeScript source.
 
 ## Tests
 

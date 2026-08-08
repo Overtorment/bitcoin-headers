@@ -25,7 +25,6 @@
     "node": ">=20.19"
   },
   "scripts": {
-    "build": "tsup src/index.ts --format esm --clean --sourcemap --target es2022 && tsup --config tsup.react-native.config.ts",
     "test": "bun test",
     "typecheck": "tsc --noEmit",
     "test:package": "bun tests/package/package-smoke.mjs",
@@ -36,7 +35,6 @@
   },
   "devDependencies": {
     "@types/bun": "^1.3.14",
-    "tsup": "^8.5.1",
     "typescript": "^5.9.3"
   }
 }
