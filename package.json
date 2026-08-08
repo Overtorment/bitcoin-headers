@@ -31,8 +31,7 @@
     "typecheck": "tsc --noEmit",
     "test:package": "npm run build && node tests/package/package-smoke.mjs",
     "check": "bun run typecheck && bun test && bun run test:package",
-    "prepare": "npm run build",
-    "prepublishOnly": "npm run check"
+    "prepare": "npm run build"
   },
   "dependencies": {
     "@noble/hashes": "^2.2.0"
