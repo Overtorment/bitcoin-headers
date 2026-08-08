@@ -8,10 +8,10 @@
   "sideEffects": false,
   "main": "./dist/index.js",
   "module": "./dist/index.js",
-  "types": "./dist/index.d.ts",
+  "types": "./src/index.ts",
   "exports": {
     ".": {
-      "types": "./dist/index.d.ts",
+      "types": "./src/index.ts",
       "react-native": "./dist/react-native.js",
       "import": "./dist/index.js",
       "default": "./dist/index.js"
@@ -19,13 +19,14 @@
   },
   "files": [
     "dist",
+    "src",
     "README.md"
   ],
   "engines": {
     "node": ">=20.19"
   },
   "scripts": {
-    "build": "tsup src/index.ts --format esm --dts --clean --sourcemap --target es2022 && tsup --config tsup.react-native.config.ts",
+    "build": "tsup src/index.ts --format esm --clean --sourcemap --target es2022 && tsup --config tsup.react-native.config.ts",
     "test": "bun test",
     "typecheck": "tsc --noEmit",
     "test:package": "npm run build && node tests/package/package-smoke.mjs",

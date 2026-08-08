@@ -7,7 +7,7 @@ import { defineConfig } from "tsup";
 export default defineConfig({
   entry: { "react-native": "src/react-native.ts" },
   format: ["esm"],
-  dts: true,
+  dts: false,
   sourcemap: true,
   splitting: false,
   platform: "neutral",
