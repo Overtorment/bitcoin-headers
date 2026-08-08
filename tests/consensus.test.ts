@@ -146,9 +146,7 @@ describe("header consensus", () => {
     expect(chain.tipHeight).toBe(665_281);
     expect(chain.tipHashDisplay).toBe(mainnetFixture.headers[1]!.hashDisplay);
     expect(chain.headers).toHaveLength(2);
-    expect(chain.chainWork).toBe(
-      chain.cumulativeWorkByHeight.get(665_281),
-    );
+    expect(chain.cumulativeWorkByHeight.get(665_281)).toBe(chain.chainWork);
   });
 
   test("rejects a post-checkpoint header that does not beat median-time-past", () => {
