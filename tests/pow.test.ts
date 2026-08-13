@@ -77,6 +77,13 @@ describe("header PoW", () => {
     expect(() => assertValidHeaderLink(weakPow, parentHash)).toThrow(
       /proof-of-work/i,
     );
+
+    const padded = new Uint8Array(64);
+    padded.set(parentHash);
+    expect(() => assertValidHeaderLink(child, padded)).toThrow(/32 bytes/i);
+    expect(() => assertValidHeaderLink(child, parentHash.subarray(0, 31))).toThrow(
+      /32 bytes/i,
+    );
   });
 
   test("encode/decode round-trips header fields", () => {
@@ -92,12 +99,71 @@ describe("header PoW", () => {
     expect(again.nonce).toBe(original.nonce);
   });
 
+  test("mainnet retarget at height 667296 matches the real compact target", () => {
+    const periodStart = decodeBlockHeader(hexToBytes(MAINNET_665280_HEADER_HEX));
+    // Block 667295 timestamp (explorer-verified). Period start is checkpoint 665280.
+    const periodEndTimestamp = 1_611_402_924;
+    const timespan = 14 * 24 * 60 * 60;
+    const actualTimespan = periodEndTimestamp - periodStart.timestamp;
+    const clamped = Math.max(
+      Math.floor(timespan / 4),
+      Math.min(timespan * 4, actualTimespan),
+    );
+    const next =
+      (bitsToTarget(periodStart.bits) * BigInt(clamped)) / BigInt(timespan);
+    expect(targetToCompact(next)).toBe(0x170d8457);
+  });
+
   test("hashToUint256 reads 32-byte hashes little-endian", () => {
     const bytes = new Uint8Array(32);
     bytes[0] = 0x01;
     bytes[1] = 0x02;
     expect(hashToUint256(bytes)).toBe(0x0201n);
     expect(() => hashToUint256(new Uint8Array(31))).toThrow(/32 bytes/i);
+
+    const padded = new Uint8Array(40);
+    padded[5] = 0x01;
+    padded[6] = 0x02;
+    expect(hashToUint256(padded.subarray(5, 37))).toBe(0x0201n);
+  });
+
+  test("meetsTarget returns false for invalid compact nBits instead of throwing", () => {
+    const hash = new Uint8Array(32);
+    expect(meetsTarget(hash, 0x00000000)).toBe(false);
+    expect(meetsTarget(hash, 0x1d80ffff)).toBe(false);
+    expect(meetsTarget(hash, 0x2300ffff)).toBe(false);
+    expect(meetsTarget(hash, 0x207fffff)).toBe(false);
+    expect(meetsTarget(hash, 0x207fffff, (1n << 256n) - 1n)).toBe(true);
+    expect(() => meetsTarget(hash, 0x1d00ffff, 0n)).toThrow(
+      /proof-of-work limit/i,
+    );
+  });
+
+  test("encodeBlockHeader rejects non-integer and out-of-range fields", () => {
+    const header = decodeBlockHeader(hexToBytes(MAINNET_665280_HEADER_HEX));
+
+    expect(() => encodeBlockHeader({ ...header, nonce: -1 })).toThrow(/uint32/i);
+    expect(() => encodeBlockHeader({ ...header, nonce: 2 ** 32 })).toThrow(
+      /uint32/i,
+    );
+    expect(() => encodeBlockHeader({ ...header, timestamp: 1.9 })).toThrow(
+      /uint32/i,
+    );
+    expect(() => encodeBlockHeader({ ...header, bits: Number.NaN })).toThrow(
+      /uint32/i,
+    );
+    expect(() => encodeBlockHeader({ ...header, version: Infinity })).toThrow(
+      /32-bit/i,
+    );
+
+    const maxVersion = hexToBytes(MAINNET_665280_HEADER_HEX);
+    maxVersion[0] = 0xff;
+    maxVersion[1] = 0xff;
+    maxVersion[2] = 0xff;
+    maxVersion[3] = 0xff;
+    const decoded = decodeBlockHeader(maxVersion);
+    expect(decoded.version).toBe(-1);
+    expect(bytesToHex(encodeBlockHeader(decoded))).toBe(bytesToHex(maxVersion));
   });
 
   test.each([

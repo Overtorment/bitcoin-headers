@@ -1,4 +1,4 @@
-import { bytesToHex } from "./bytes.ts";
+import { bytesToHex, equalBytes } from "./bytes.ts";
 import { sha256d } from "./hash.ts";
 import { encodeBlockHeader, type BlockHeader } from "./header.ts";
 
@@ -76,11 +76,17 @@ export function bitsToTarget(bits: number): bigint {
 /** Interpret 32-byte internal (LE) hash as uint256. */
 export function hashToUint256(hashInternal: Uint8Array): bigint {
   if (hashInternal.length !== 32) throw new Error("hash must be 32 bytes");
-  let n = 0n;
-  for (let i = 0; i < 32; i++) {
-    n |= BigInt(hashInternal[i]!) << (8n * BigInt(i));
-  }
-  return n;
+  const view = new DataView(
+    hashInternal.buffer,
+    hashInternal.byteOffset,
+    hashInternal.byteLength,
+  );
+  return (
+    view.getBigUint64(0, true) |
+    (view.getBigUint64(8, true) << 64n) |
+    (view.getBigUint64(16, true) << 128n) |
+    (view.getBigUint64(24, true) << 192n)
+  );
 }
 
 export function headerHashInternal(header: BlockHeader): Uint8Array {
@@ -92,24 +98,36 @@ export function headerHashDisplay(header: BlockHeader): string {
   return bytesToHex(internal.slice().reverse());
 }
 
-export function meetsTarget(hashInternal: Uint8Array, bits: number): boolean {
-  return hashToUint256(hashInternal) <= bitsToTarget(bits);
+export function meetsTarget(
+  hashInternal: Uint8Array,
+  bits: number,
+  powLimit: bigint = MAINNET_POW_LIMIT,
+): boolean {
+  if (powLimit <= 0n || powLimit > MAX_UINT256) {
+    throw new RangeError("proof-of-work limit must be a positive uint256");
+  }
+  let target: bigint;
+  try {
+    target = decodeCompactTarget(bits, powLimit);
+  } catch {
+    return false;
+  }
+  return hashToUint256(hashInternal) <= target;
 }
 
 export function assertValidHeaderLink(
   header: BlockHeader,
   expectedPrevInternal: Uint8Array,
+  powLimit: bigint = MAINNET_POW_LIMIT,
 ): Uint8Array {
+  if (expectedPrevInternal.length !== 32) {
+    throw new Error("expected previous hash must be 32 bytes");
+  }
   const hash = headerHashInternal(header);
-  if (header.previousBlockHash.length !== 32) {
-    throw new Error("previousBlockHash must be 32 bytes");
+  if (!equalBytes(header.previousBlockHash, expectedPrevInternal)) {
+    throw new Error("header previous hash mismatch");
   }
-  for (let i = 0; i < 32; i++) {
-    if (header.previousBlockHash[i] !== expectedPrevInternal[i]) {
-      throw new Error("header previous hash mismatch");
-    }
-  }
-  if (!meetsTarget(hash, header.bits)) {
+  if (!meetsTarget(hash, header.bits, powLimit)) {
     throw new Error("header proof-of-work does not meet target");
   }
   return hash;
