@@ -1,14 +1,15 @@
 import { bytesFromHex, bytesToHex, equalBytes } from "./bytes.ts";
+import { sha256d } from "./hash.ts";
 import { encodeBlockHeader, decodeBlockHeader, type BlockHeader } from "./header.ts";
 import {
   decodeCompactTarget,
   hashToUint256,
-  headerHashInternal,
   targetToCompact,
 } from "./pow.ts";
 import type { HeaderRecord } from "./types.ts";
 
 export type TrustedHeaderCheckpoint = {
+  /** Must be a retarget-interval boundary so period-start headers are available. */
   height: number;
   headerBytes: Uint8Array;
   hashDisplay: string;
@@ -42,6 +43,7 @@ export type ValidatedHeaderChain = {
   readonly tipHashDisplay: string;
   /** Cumulative work represented by this chain, beginning at its checkpoint. */
   readonly chainWork: bigint;
+  readonly params: HeaderConsensusParams;
   readonly byHeight: ReadonlyMap<number, HeaderRecord>;
   readonly heightByHashInternal: ReadonlyMap<string, number>;
   readonly entriesByHeight: ReadonlyMap<number, HeaderChainEntry>;
@@ -72,8 +74,9 @@ export class HeaderConsensusError extends Error {
 }
 
 function fail(height: number, message: string, cause?: unknown): never {
+  const reported = Number(height);
   throw new HeaderConsensusError(
-    height,
+    Number.isFinite(reported) ? reported : 0,
     message,
     cause === undefined ? undefined : { cause },
   );
@@ -106,15 +109,21 @@ function validateParams(params: HeaderConsensusParams): void {
   ) {
     throw new RangeError("checkpoint height must be a non-negative safe integer");
   }
+  if (params.checkpoint.height % params.retargetInterval !== 0) {
+    throw new RangeError(
+      "checkpoint height must be a retarget interval boundary",
+    );
+  }
   if (params.checkpoint.headerBytes.length !== 80) {
     throw new RangeError("checkpoint header must be exactly 80 bytes");
   }
-  if (
-    params.checkpoint.previousTimestamps.length !==
-    params.medianTimeSpan - 1
-  ) {
+  const precedingTimestamps = Math.min(
+    params.medianTimeSpan - 1,
+    params.checkpoint.height,
+  );
+  if (params.checkpoint.previousTimestamps.length !== precedingTimestamps) {
     throw new RangeError(
-      `checkpoint requires exactly ${params.medianTimeSpan - 1} preceding timestamps`,
+      `checkpoint requires exactly ${precedingTimestamps} preceding timestamps`,
     );
   }
   for (const timestamp of params.checkpoint.previousTimestamps) {
@@ -136,7 +145,7 @@ export function storedHeaderFromBlockHeader(
     throw new RangeError("header height must be a non-negative safe integer");
   }
   const bytes = encodeBlockHeader(header);
-  const hashInternal = headerHashInternal(header);
+  const hashInternal = sha256d(bytes);
   return {
     height,
     hashDisplay: displayHash(hashInternal),
@@ -160,26 +169,36 @@ function decodeRecord(
   record: HeaderRecord,
   powLimit: bigint,
 ): Omit<HeaderChainEntry, "cumulativeWork"> {
+  if (record == null || typeof record !== "object") {
+    fail(0, "header record is missing");
+  }
+  const height = record.height;
+  const hashDisplay = record.hashDisplay;
+  const hashInternalHex = record.hashInternalHex;
+  const headerHex = record.headerHex;
+  if (!Number.isSafeInteger(height) || height < 0) {
+    fail(height, "height must be a non-negative safe integer");
+  }
   let bytes: Uint8Array;
   try {
-    bytes = bytesFromHex(record.headerHex, 80, "headerHex");
+    bytes = bytesFromHex(headerHex, 80, "headerHex");
   } catch (error) {
-    fail(record.height, error instanceof Error ? error.message : String(error), error);
+    fail(height, error instanceof Error ? error.message : String(error), error);
   }
   const header = decodeBlockHeader(bytes);
-  const hashInternal = headerHashInternal(header);
-  if (bytesToHex(hashInternal) !== record.hashInternalHex) {
-    fail(record.height, "hashInternalHex does not match serialized header");
+  const hashInternal = sha256d(bytes);
+  if (bytesToHex(hashInternal) !== hashInternalHex) {
+    fail(height, "hashInternalHex does not match serialized header");
   }
-  if (displayHash(hashInternal) !== record.hashDisplay) {
-    fail(record.height, "display hash does not match serialized header");
+  if (displayHash(hashInternal) !== hashDisplay) {
+    fail(height, "display hash does not match serialized header");
   }
   let target: bigint;
   try {
     target = decodeCompactTarget(header.bits, powLimit);
   } catch (error) {
     fail(
-      record.height,
+      height,
       `invalid nBits 0x${header.bits.toString(16).padStart(8, "0")}: ${
         error instanceof Error ? error.message : String(error)
       }`,
@@ -187,7 +206,7 @@ function decodeRecord(
     );
   }
   return {
-    record: Object.freeze({ ...record }),
+    record: Object.freeze({ height, hashDisplay, hashInternalHex, headerHex }),
     header: Object.freeze({
       ...header,
       previousBlockHash: header.previousBlockHash.slice(),
@@ -253,11 +272,8 @@ function assertTimestamp(
   currentTimeSeconds: number,
 ): void {
   const prior: number[] = [];
-  for (
-    let priorHeight = height - params.medianTimeSpan;
-    priorHeight < height;
-    priorHeight++
-  ) {
+  const oldest = Math.max(0, height - params.medianTimeSpan);
+  for (let priorHeight = oldest; priorHeight < height; priorHeight++) {
     const timestamp = timestampAt(priorHeight);
     if (timestamp === undefined) {
       fail(
@@ -310,6 +326,54 @@ function checkpointTimestampAt(
     : undefined;
 }
 
+function validateSuccessor(
+  record: HeaderRecord,
+  previous: HeaderChainEntry,
+  params: HeaderConsensusParams,
+  currentTimeSeconds: number,
+  entryAt: (height: number) => HeaderChainEntry | undefined,
+): HeaderChainEntry {
+  if (record == null || typeof record !== "object") {
+    fail(previous.record.height + 1, "header record is missing");
+  }
+  const decoded = decodeRecord(record, params.powLimit);
+  const height = decoded.record.height;
+  if (height !== previous.record.height + 1) {
+    fail(height, `height is not contiguous after ${previous.record.height}`);
+  }
+  assertLink(height, decoded.header, previous);
+  const requiredBits = expectedBits(
+    height,
+    previous,
+    entryAt,
+    params,
+  );
+  if (decoded.header.bits !== requiredBits) {
+    fail(
+      height,
+      `nBits 0x${decoded.header.bits
+        .toString(16)
+        .padStart(8, "0")} does not equal expected 0x${requiredBits
+        .toString(16)
+        .padStart(8, "0")}`,
+    );
+  }
+  assertTimestamp(
+    height,
+    decoded.header,
+    (lookupHeight) =>
+      entryAt(lookupHeight)?.header.timestamp ??
+      checkpointTimestampAt(lookupHeight, params),
+    params,
+    currentTimeSeconds,
+  );
+  assertProofOfWork(decoded);
+  return Object.freeze({
+    ...decoded,
+    cumulativeWork: previous.cumulativeWork + decoded.work,
+  });
+}
+
 /**
  * Incrementally validates one candidate without copying or changing the
  * canonical chain. `append` is linear in newly supplied headers.
@@ -327,10 +391,9 @@ export class HeaderBranchBuilder {
   constructor(
     base: ValidatedHeaderChain,
     commonAncestorHeight: number,
-    params: HeaderConsensusParams,
     currentTimeSeconds: number,
   ) {
-    validateParams(params);
+    validateParams(base.params);
     if (
       !Number.isSafeInteger(currentTimeSeconds) ||
       currentTimeSeconds < 0
@@ -346,7 +409,7 @@ export class HeaderBranchBuilder {
       );
     }
     this.#base = base;
-    this.#params = params;
+    this.#params = base.params;
     this.#currentTimeSeconds = currentTimeSeconds;
     this.#commonAncestorHeight = commonAncestorHeight;
     this.#previous = ancestor;
@@ -368,55 +431,34 @@ export class HeaderBranchBuilder {
     const entryAt = (height: number): HeaderChainEntry | undefined =>
       this.#entriesByHeight.get(height) ??
       this.#base.entriesByHeight.get(height);
-    const timestampAt = (height: number): number | undefined =>
-      entryAt(height)?.header.timestamp ??
-      checkpointTimestampAt(height, this.#params);
 
-    for (const record of records) {
-      if (record.height !== this.#previous.record.height + 1) {
-        fail(
-          record.height,
-          `height is not contiguous after ${this.#previous.record.height}`,
+    const startLength = this.#headers.length;
+    const startPrevious = this.#previous;
+    try {
+      for (const record of records) {
+        const entry = validateSuccessor(
+          record,
+          this.#previous,
+          this.#params,
+          this.#currentTimeSeconds,
+          entryAt,
         );
-      }
-      const decoded = decodeRecord(record, this.#params.powLimit);
-      assertLink(record.height, decoded.header, this.#previous);
-      const requiredBits = expectedBits(
-        record.height,
-        this.#previous,
-        entryAt,
-        this.#params,
-      );
-      if (decoded.header.bits !== requiredBits) {
-        fail(
-          record.height,
-          `nBits 0x${decoded.header.bits
-            .toString(16)
-            .padStart(8, "0")} does not equal expected 0x${requiredBits
-            .toString(16)
-            .padStart(8, "0")}`,
+        this.#headers.push(entry.record);
+        this.#entriesByHeight.set(entry.record.height, entry);
+        this.#cumulativeWorkByHeight.set(
+          entry.record.height,
+          entry.cumulativeWork,
         );
+        this.#previous = entry;
       }
-      assertTimestamp(
-        record.height,
-        decoded.header,
-        timestampAt,
-        this.#params,
-        this.#currentTimeSeconds,
-      );
-      assertProofOfWork(decoded);
-      const entry: HeaderChainEntry = Object.freeze({
-        ...decoded,
-        cumulativeWork:
-          this.#previous.cumulativeWork + decoded.work,
-      });
-      this.#headers.push(entry.record);
-      this.#entriesByHeight.set(entry.record.height, entry);
-      this.#cumulativeWorkByHeight.set(
-        entry.record.height,
-        entry.cumulativeWork,
-      );
-      this.#previous = entry;
+    } catch (error) {
+      while (this.#headers.length > startLength) {
+        const record = this.#headers.pop()!;
+        this.#entriesByHeight.delete(record.height);
+        this.#cumulativeWorkByHeight.delete(record.height);
+      }
+      this.#previous = startPrevious;
+      throw error;
     }
   }
 
@@ -453,19 +495,22 @@ export function validateHeaderChain(
     );
   }
 
-  const firstRecord = records[0]!;
-  if (firstRecord.height !== params.checkpoint.height) {
-    fail(
-      firstRecord.height,
-      `chain must start at trusted checkpoint ${params.checkpoint.height}`,
-    );
+  const firstRecord = records[0];
+  if (firstRecord == null || typeof firstRecord !== "object") {
+    fail(params.checkpoint.height, "header record is missing");
   }
   let first: Omit<HeaderChainEntry, "cumulativeWork">;
   try {
     first = decodeRecord(firstRecord, params.powLimit);
   } catch (error) {
     if (error instanceof HeaderConsensusError) throw error;
-    fail(firstRecord.height, "cannot decode trusted checkpoint", error);
+    fail(params.checkpoint.height, "cannot decode trusted checkpoint", error);
+  }
+  if (first.record.height !== params.checkpoint.height) {
+    fail(
+      first.record.height,
+      `chain must start at trusted checkpoint ${params.checkpoint.height}`,
+    );
   }
   if (
     !equalBytes(
@@ -474,14 +519,14 @@ export function validateHeaderChain(
     ) ||
     first.record.hashDisplay !== params.checkpoint.hashDisplay
   ) {
-    fail(firstRecord.height, "trusted checkpoint seed does not match");
+    fail(first.record.height, "trusted checkpoint seed does not match");
   }
   assertProofOfWork(first);
   if (
     first.header.timestamp >
     currentTimeSeconds + params.maxFutureSeconds
   ) {
-    fail(firstRecord.height, "trusted checkpoint timestamp is too far in the future");
+    fail(first.record.height, "trusted checkpoint timestamp is too far in the future");
   }
 
   const headers: HeaderRecord[] = [first.record];
@@ -500,50 +545,18 @@ export function validateHeaderChain(
   entriesByHeight.set(first.record.height, firstEntry);
   cumulativeWorkByHeight.set(first.record.height, firstEntry.cumulativeWork);
 
-  const timestampAt = (height: number): number | undefined =>
-    entriesByHeight.get(height)?.header.timestamp ??
-    checkpointTimestampAt(height, params);
+  const entryAt = (height: number): HeaderChainEntry | undefined =>
+    entriesByHeight.get(height);
 
   let previous = firstEntry;
   for (let index = 1; index < records.length; index++) {
-    const record = records[index]!;
-    if (record.height !== previous.record.height + 1) {
-      fail(
-        record.height,
-        `height is not contiguous after ${previous.record.height}`,
-      );
-    }
-    const decoded = decodeRecord(record, params.powLimit);
-    assertLink(record.height, decoded.header, previous);
-    const requiredBits = expectedBits(
-      record.height,
+    const entry = validateSuccessor(
+      records[index]!,
       previous,
-      (height) => entriesByHeight.get(height),
-      params,
-    );
-    if (decoded.header.bits !== requiredBits) {
-      fail(
-        record.height,
-        `nBits 0x${decoded.header.bits
-          .toString(16)
-          .padStart(8, "0")} does not equal expected 0x${requiredBits
-          .toString(16)
-          .padStart(8, "0")}`,
-      );
-    }
-    assertTimestamp(
-      record.height,
-      decoded.header,
-      timestampAt,
       params,
       currentTimeSeconds,
+      entryAt,
     );
-    assertProofOfWork(decoded);
-
-    const entry: HeaderChainEntry = Object.freeze({
-      ...decoded,
-      cumulativeWork: previous.cumulativeWork + decoded.work,
-    });
     headers.push(entry.record);
     byHeight.set(entry.record.height, entry.record);
     heightByHashInternal.set(
@@ -561,6 +574,7 @@ export function validateHeaderChain(
     tipHashInternal: previous.hashInternal.slice(),
     tipHashDisplay: previous.record.hashDisplay,
     chainWork: previous.cumulativeWork,
+    params,
     byHeight,
     heightByHashInternal,
     entriesByHeight,

@@ -22,13 +22,29 @@ export function decodeBlockHeader(bytes: Uint8Array): BlockHeader {
   };
 }
 
+function assertUint32(value: number, label: string): void {
+  if (!Number.isInteger(value) || value < 0 || value > 0xffffffff) {
+    throw new RangeError(`${label} must be a uint32`);
+  }
+}
+
 export function encodeBlockHeader(header: BlockHeader): Uint8Array {
+  if (
+    !Number.isInteger(header.version) ||
+    header.version < -0x80000000 ||
+    header.version > 0xffffffff
+  ) {
+    throw new RangeError("version must be a 32-bit integer");
+  }
   if (header.previousBlockHash.length !== 32) {
     throw new Error("previous block hash must be 32 bytes");
   }
   if (header.merkleRoot.length !== 32) {
     throw new Error("merkle root must be 32 bytes");
   }
+  assertUint32(header.timestamp, "timestamp");
+  assertUint32(header.bits, "bits");
+  assertUint32(header.nonce, "nonce");
   const out = new Uint8Array(80);
   const view = new DataView(out.buffer, out.byteOffset, out.byteLength);
   view.setInt32(0, header.version, true);

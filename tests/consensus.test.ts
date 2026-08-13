@@ -10,6 +10,7 @@ import {
   headerHashInternal,
   headerWork,
   HeaderBranchBuilder,
+  HeaderConsensusError,
   hexToBytes,
   MAINNET_HEADER_CONSENSUS,
   storedHeaderFromBlockHeader,
@@ -91,9 +92,7 @@ function fixture(bits = EASY_BITS): {
         height: 0,
         headerBytes: encodeBlockHeader(checkpoint),
         hashDisplay: headerHashDisplay(checkpoint),
-        previousTimestamps: [
-          890, 900, 910, 920, 930, 940, 950, 960, 970, 980,
-        ],
+        previousTimestamps: [],
       },
     },
     records: [record(0, checkpoint)],
@@ -146,6 +145,7 @@ describe("header consensus", () => {
     expect(chain.tipHeight).toBe(665_281);
     expect(chain.tipHashDisplay).toBe(mainnetFixture.headers[1]!.hashDisplay);
     expect(chain.headers).toHaveLength(2);
+    expect(chain.params).toBe(MAINNET_HEADER_CONSENSUS);
     expect(chain.cumulativeWorkByHeight.get(665_281)).toBe(chain.chainWork);
   });
 
@@ -203,6 +203,18 @@ describe("header consensus", () => {
     const chain = validateHeaderChain(state.records, state.params, 10_000);
     expect(chain.tipHeight).toBe(4);
     expect(chain.entriesByHeight.get(4)?.header.bits).toBe(expected);
+  });
+
+  test("rejects stale nBits at a retarget boundary", () => {
+    const state = fixture();
+    append(state, 1_001);
+    append(state, 1_002);
+    append(state, 1_003);
+    append(state, 1_004, EASY_BITS);
+
+    expect(() =>
+      validateHeaderChain(state.records, state.params, 10_000),
+    ).toThrow(/height 4.*nBits/i);
   });
 
   test("retarget clamps a long timespan to four times and caps at pow limit", () => {
@@ -348,6 +360,95 @@ describe("header consensus", () => {
     ).toThrow(/display hash/i);
   });
 
+  test("rejects missing records as consensus failures", () => {
+    const state = fixture();
+    expect(() =>
+      validateHeaderChain(
+        [null as unknown as HeaderRecord],
+        state.params,
+        10_000,
+      ),
+    ).toThrow(HeaderConsensusError);
+
+    append(state, 1_010);
+    expect(() =>
+      validateHeaderChain(
+        [state.records[0]!, null as unknown as HeaderRecord],
+        state.params,
+        10_000,
+      ),
+    ).toThrow(HeaderConsensusError);
+  });
+
+  test("stores the header bytes that were actually validated", () => {
+    const state = fixture();
+    append(state, 1_010);
+    const honest = state.records[1]!;
+    let reads = 0;
+    const shifting: HeaderRecord = {
+      get height() {
+        return honest.height;
+      },
+      get hashDisplay() {
+        return honest.hashDisplay;
+      },
+      get hashInternalHex() {
+        return honest.hashInternalHex;
+      },
+      get headerHex() {
+        reads += 1;
+        return reads === 1 ? honest.headerHex : "aa".repeat(80);
+      },
+    };
+
+    const chain = validateHeaderChain(
+      [state.records[0]!, shifting],
+      state.params,
+      10_000,
+    );
+    expect(chain.headers[1]!.headerHex).toBe(honest.headerHex);
+  });
+
+  test("anchors the checkpoint at the snapshotted height", () => {
+    const state = fixture();
+    const honest = state.records[0]!;
+    let reads = 0;
+    const shifting: HeaderRecord = {
+      get height() {
+        reads += 1;
+        return reads === 1 ? honest.height : honest.height + 1;
+      },
+      get hashDisplay() {
+        return honest.hashDisplay;
+      },
+      get hashInternalHex() {
+        return honest.hashInternalHex;
+      },
+      get headerHex() {
+        return honest.headerHex;
+      },
+    };
+
+    const chain = validateHeaderChain([shifting], state.params, 10_000);
+    expect(chain.headers[0]!.height).toBe(honest.height);
+    expect(chain.tipHeight).toBe(honest.height);
+  });
+
+  test("HeaderConsensusError.height is numeric for non-numeric stored heights", () => {
+    const state = fixture();
+    const bad = {
+      ...state.records[0]!,
+      height: "0" as unknown as number,
+    };
+    try {
+      validateHeaderChain([bad], state.params, 10_000);
+      throw new Error("expected consensus failure");
+    } catch (error) {
+      expect(error).toBeInstanceOf(HeaderConsensusError);
+      expect(typeof (error as HeaderConsensusError).height).toBe("number");
+    }
+  });
+
   test("HeaderBranchBuilder validates a heavier fork from a common ancestor", () => {
     const state = fixture();
     append(state, 1_010);
@@ -371,12 +472,7 @@ describe("header consensus", () => {
       powLimit: state.params.powLimit,
     });
 
-    const branch = new HeaderBranchBuilder(
-      canonical,
-      1,
-      state.params,
-      10_000,
-    );
+    const branch = new HeaderBranchBuilder(canonical, 1, 10_000);
     branch.append([
       storedHeaderFromBlockHeader(2, forkA),
       storedHeaderFromBlockHeader(3, forkB),
@@ -392,16 +488,107 @@ describe("header consensus", () => {
     expect(finished.tipHashDisplay).toBe(headerHashDisplay(forkB));
   });
 
+  test("rejects successor heights that are not safe integers", () => {
+    const checkpoint = mineHeader({
+      bits: EASY_BITS,
+      timestamp: 1_000,
+      marker: 1,
+      powLimit: EASY_LIMIT,
+    });
+    const params: HeaderConsensusParams = {
+      powLimit: EASY_LIMIT,
+      targetSpacingSeconds: 10,
+      targetTimespanSeconds: 40,
+      retargetInterval: 1,
+      medianTimeSpan: 11,
+      maxFutureSeconds: 7_200,
+      checkpoint: {
+        height: Number.MAX_SAFE_INTEGER,
+        headerBytes: encodeBlockHeader(checkpoint),
+        hashDisplay: headerHashDisplay(checkpoint),
+        previousTimestamps: [890, 900, 910, 920, 930, 940, 950, 960, 970, 980],
+      },
+    };
+    const first = storedHeaderFromBlockHeader(
+      Number.MAX_SAFE_INTEGER,
+      checkpoint,
+    );
+    const unsafe = { ...first, height: Number.MAX_SAFE_INTEGER + 1 };
+
+    expect(() => validateHeaderChain([first, unsafe], params, 10_000)).toThrow(
+      /safe integer/i,
+    );
+  });
+
+  test("rejects a checkpoint that is not on a retarget boundary", () => {
+    const state = fixture();
+    const params = {
+      ...state.params,
+      checkpoint: {
+        ...state.params.checkpoint,
+        height: 1,
+        previousTimestamps: [900],
+      },
+    };
+    const records = [{ ...state.records[0]!, height: 1 }];
+
+    expect(() => validateHeaderChain(records, params, 10_000)).toThrow(
+      /retarget interval boundary/i,
+    );
+  });
+
+  test("genesis-anchored MTP uses only real ancestors", () => {
+    const equalToGenesis = fixture();
+    append(equalToGenesis, 1_000);
+    expect(() =>
+      validateHeaderChain(equalToGenesis.records, equalToGenesis.params, 10_000),
+    ).toThrow(/median-time-past/i);
+
+    const justAfterGenesis = fixture();
+    append(justAfterGenesis, 1_001);
+    expect(
+      validateHeaderChain(
+        justAfterGenesis.records,
+        justAfterGenesis.params,
+        10_000,
+      ).tipHeight,
+    ).toBe(1);
+  });
+
+  test("HeaderBranchBuilder rolls back a partial append on failure", () => {
+    const state = fixture();
+    const canonical = validateHeaderChain(state.records, state.params, 10_000);
+    const branch = new HeaderBranchBuilder(canonical, 0, 10_000);
+    const good = mineHeader({
+      previousHash: hexToInternal(state.records[0]!.hashInternalHex),
+      bits: EASY_BITS,
+      timestamp: 1_010,
+      marker: 2,
+      powLimit: state.params.powLimit,
+    });
+    const unlinked = mineHeader({
+      previousHash: new Uint8Array(32).fill(1),
+      bits: EASY_BITS,
+      timestamp: 1_020,
+      marker: 3,
+      powLimit: state.params.powLimit,
+    });
+
+    expect(() =>
+      branch.append([
+        storedHeaderFromBlockHeader(1, good),
+        storedHeaderFromBlockHeader(2, unlinked),
+      ]),
+    ).toThrow(/previous hash/i);
+    expect(branch.length).toBe(0);
+    expect(branch.tipHeight).toBe(0);
+  });
+
   test("HeaderBranchBuilder rejects an invalid competing header", () => {
     const state = fixture();
     append(state, 1_010);
     const canonical = validateHeaderChain(state.records, state.params, 10_000);
-    const branch = new HeaderBranchBuilder(
-      canonical,
-      0,
-      state.params,
-      10_000,
-    );
+    const branch = new HeaderBranchBuilder(canonical, 0, 10_000);
     const unlinked = mineHeader({
       previousHash: new Uint8Array(32).fill(1),
       bits: EASY_BITS,

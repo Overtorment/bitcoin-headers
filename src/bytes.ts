@@ -7,16 +7,35 @@ export function equalBytes(a: Uint8Array, b: Uint8Array): boolean {
 
 export function hexToBytes(hex: string): Uint8Array {
   if (hex.length % 2 !== 0) throw new Error(`odd hex length: ${hex.length}`);
-  if (!/^[0-9a-fA-F]*$/.test(hex)) throw new Error("invalid hex string");
   const out = new Uint8Array(hex.length / 2);
   for (let i = 0; i < out.length; i++) {
-    out[i] = Number.parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+    const hi = nibble(hex.charCodeAt(i * 2));
+    const lo = nibble(hex.charCodeAt(i * 2 + 1));
+    if (hi < 0 || lo < 0) throw new Error("invalid hex string");
+    out[i] = (hi << 4) | lo;
   }
   return out;
 }
 
+const HEX_NIBBLE = new Int8Array(128).fill(-1);
+for (let i = 0; i < 10; i++) HEX_NIBBLE[48 + i] = i;
+for (let i = 0; i < 6; i++) {
+  HEX_NIBBLE[65 + i] = 10 + i;
+  HEX_NIBBLE[97 + i] = 10 + i;
+}
+
+function nibble(code: number): number {
+  return code < 128 ? HEX_NIBBLE[code]! : -1;
+}
+
+const HEX_BYTE = Array.from({ length: 256 }, (_, i) =>
+  i.toString(16).padStart(2, "0"),
+);
+
 export function bytesToHex(bytes: Uint8Array): string {
-  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+  const hex = new Array<string>(bytes.length);
+  for (let i = 0; i < bytes.length; i++) hex[i] = HEX_BYTE[bytes[i]!]!;
+  return hex.join("");
 }
 
 export function bytesFromHex(
